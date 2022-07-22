@@ -28,7 +28,7 @@ jobs:
           pip install -r requirements.txt
       - name: Delete previous model, if exists
         run: |
-          export HF_TAG=$(python -c "import os; print(os.environ.get('GITHUB_BASE_REF') or os.environ.get('GITHUB_REF_NAME'))")
+          export HF_TAG=$(python -c "import os; print(os.environ.get('GITHUB_REF_NAME') or 'main')")
           python -c "from huggingface_hub import delete_repo; delete_repo(token='$BLOOM_TESTING_WRITE_TOKEN', \
           name='test-bloomd-350m-$HF_TAG', organization='bloom-testing')" || true
       - name: Convert model and push to hub
@@ -40,7 +40,7 @@ jobs:
 
   run-tests:
     runs-on: ubuntu-latest
-    needs: convert-model
+    #needs: convert-model
     strategy:
       matrix:
         python-version: [ 3.7, 3.8, 3.9 ]
@@ -64,7 +64,7 @@ jobs:
           pip install -r requirements-dev.txt
       - name: Test
         run: |
-          export HF_TAG=$(python -c "import os; print(os.environ.get('GITHUB_BASE_REF') or os.environ.get('GITHUB_REF_NAME'))")
+          export HF_TAG=$(python -c "import os; print(os.environ.get('GITHUB_REF_NAME') or 'main')")
           export MODEL_NAME=bloom-testing/test-bloomd-350m-$HF_TAG
           export REF_NAME=bigscience/bloom-350m
 

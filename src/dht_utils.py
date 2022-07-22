@@ -105,7 +105,7 @@ def get_remote_module(
 
 def get_remote_module_infos(
     dht: DHT,
-    uid_or_uids: Union[ModuleUID, List[ModuleUID]],
+    uid_or_uids: Union[ModuleUID, Sequence[ModuleUID]],
     expiration_time: Optional[DHTExpiration] = None,
 ) -> List[Optional[RemoteModuleInfo]]:
     single_uid = isinstance(uid_or_uids, ModuleUID)
@@ -117,7 +117,7 @@ def get_remote_module_infos(
 
 
 async def _get_remote_module_infos(
-    dht: DHT, node: DHTNode, uids: List[ModuleUID], expiration_time: Optional[DHTExpiration]
+    dht: DHT, node: DHTNode, uids: Sequence[ModuleUID], expiration_time: Optional[DHTExpiration]
 ) -> List[Optional[RemoteModuleInfo]]:
     if expiration_time is None:
         expiration_time = get_dht_time()
