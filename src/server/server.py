@@ -4,7 +4,7 @@ import multiprocessing as mp
 import random
 import threading
 import time
-from typing import Dict, Optional, Sequence, Union
+from typing import Dict, Optional, List, Sequence, Union
 
 import torch
 from hivemind import DHT, MAX_DHT_TIME_DISCREPANCY_SECONDS, BatchTensorDescriptor, get_dht_time
@@ -28,7 +28,144 @@ logger = get_logger(__file__)
 
 
 class Server(threading.Thread):
-    """Serves one or more bloom layers for inference, forward and backward; announces oneself to the DHT"""
+    """
+    Runs Server, periodically checks that the network is balanced,
+    restarts the Server with other layers if the imbalance is significant
+    """
+
+    def __init__(
+        self,
+        prefix: Optional[str],
+        converted_model_name_or_path: str,
+        throughput: Union[float, str],
+        num_blocks: Optional[int] = None,
+        block_indices: Optional[str] = None,
+        num_handlers: Optional[int] = None,
+        min_batch_size: int = 1,
+        max_batch_size: int = 4096,
+        torch_dtype: Union[str, torch.dtype] = "auto",
+        cache_size_bytes: Optional[int] = None,
+        device: Optional[Union[str, torch.device]] = None,
+        initial_peers: Sequence[str] = (),
+        compression: CompressionType = CompressionType.NONE,
+        stats_report_interval: Optional[int] = None,
+        custom_module_path: Optional[str] = None,
+        update_period: float = 30,
+        expiration: Optional[float] = None,
+        max_block_selection_delay: float = 1,
+        use_auth_token: Optional[str] = None,
+        *,
+        start: bool,
+        **kwargs,
+    ):
+        """Create a server with one or more bloom blocks. See run_server.py for documentation."""
+
+        super().__init__()
+
+        self.converted_model_name_or_path = converted_model_name_or_path
+        self.num_handlers = num_handlers
+        self.min_batch_size, self.max_batch_size = min_batch_size, max_batch_size
+        self.compression = compression
+        self.stats_report_interval, self.update_period = stats_report_interval, update_period
+        self.use_auth_token = use_auth_token
+
+        if custom_module_path is not None:
+            add_custom_models_from_file(custom_module_path)
+
+        if prefix is None:
+            prefix = converted_model_name_or_path
+            assert UID_DELIMITER not in prefix and CHAIN_DELIMITER not in prefix, (
+                f"Cannot use model name as prefix (contains '{UID_DELIMITER}' or '{CHAIN_DELIMITER}'); "
+                f"Please specify --prefix manually when starting a server"
+            )
+            logger.info(f"Automatic dht prefix: {prefix}")
+        self.prefix = prefix
+
+        assert (block_indices is None) != (num_blocks is None), "please specify num_blocks or block_indices, not both"
+
+        if expiration is None:
+            expiration = max(2 * update_period, MAX_DHT_TIME_DISCREPANCY_SECONDS)
+        self.expiration = expiration
+
+        self.dht = DHT(initial_peers=initial_peers, start=True, **kwargs)
+        visible_maddrs_str = [str(a) for a in self.dht.get_visible_maddrs()]
+        logger.info(f"Running DHT node on {visible_maddrs_str}, initial peers = {initial_peers}")
+
+        device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device
+
+        self.memory_cache = MemoryCache(device, cache_size_bytes)
+
+        assert isinstance(throughput, float) or throughput in ["auto", "eval"]
+        if throughput in ["auto", "eval"]:
+            throughput = get_host_throughput(device, force_eval=(throughput == "eval"))
+        self.throughput = throughput
+
+        if isinstance(torch_dtype, str):
+            torch_dtype = DTYPE_MAP[torch_dtype]
+        assert torch_dtype in DTYPE_MAP.values(), f"torch_dtype must be one of {list(DTYPE_MAP.values())}"
+        self.torch_dtype = torch_dtype
+
+        self.block_config = BloomConfig.from_pretrained(converted_model_name_or_path, use_auth_token=use_auth_token)
+
+        if block_indices is not None:
+            try:
+                first_block_index, last_block_index = block_indices.split(":")
+                first_block_index, last_block_index = map(int, map(str.strip, (first_block_index, last_block_index)))
+            except Exception as e:
+                logger.error(f"Failed to parse --block_indices ({e}), must be start:end (e.g. 0:18)")
+                raise
+            block_indices = range(first_block_index, last_block_index)
+        else:
+            # If multiple servers (e.g., launched on the same machine by a script) get to this line at the same time,
+            # this delay decreases the probability of a race condition while choosing the best blocks to serve.
+            time.sleep(random.random() * max_block_selection_delay)
+
+            assert num_blocks is not None
+            uids = [f"{prefix}.{block_index}" for block_index in range(self.block_config.n_layer)]
+            module_infos = get_remote_module_infos(self.dht, uids, expiration_time=float("inf"))
+            block_indices = choose_best_blocks(num_blocks, module_infos)
+        self.block_indices = block_indices
+
+        self.stop = threading.Event()
+        if start:
+            self.start()
+
+    def run(self):
+        self.module_container = ModuleContainer.create(
+            dht=self.dht,
+            prefix=self.prefix,
+            converted_model_name_or_path=self.converted_model_name_or_path,
+            block_config=self.block_config,
+            memory_cache=self.memory_cache,
+            throughput=self.throughput,
+            block_indices=self.block_indices,
+            num_handlers=self.num_handlers,
+            min_batch_size=self.min_batch_size,
+            max_batch_size=self.max_batch_size,
+            torch_dtype=self.torch_dtype,
+            device=self.device,
+            compression=self.compression,
+            stats_report_interval=self.stats_report_interval,
+            update_period=self.update_period,
+            expiration=self.expiration,
+            use_auth_token=self.use_auth_token,
+            start=True,
+        )
+        try:
+            self.stop.wait()
+        finally:
+            self.module_container.shutdown()
+
+    def shutdown(self):
+        self.stop.set()
+
+        self.dht.shutdown()
+        self.dht.join()
+
+
+class ModuleContainer(threading.Thread):
+    """Serves a set of specific Bloom layers for inference, forward, and backward. Announces itself over the DHT."""
 
     def __init__(
         self,
@@ -36,14 +173,15 @@ class Server(threading.Thread):
         module_backends: Dict[str, TransformerBackend],
         *,
         device: torch.device,
-        num_connection_handlers: int = 8,
+        num_connection_handlers: int,
         throughput: float,
-        update_period: float = 30,
+        update_period: float,
         expiration: Optional[float] = None,
         start: bool,
         **kwargs,
     ):
-        threading.Thread.__init__(self)
+        super().__init__()
+
         self.dht, self.module_backends = dht, module_backends
         self.throughput, self.update_period, self.expiration = throughput, update_period, expiration
         self.conn_handlers = [
@@ -65,7 +203,7 @@ class Server(threading.Thread):
 
     def run(self):
         """
-        Starts Server in the current thread. Initializes dht if necessary, starts connection handlers,
+        Runs ModuleContainer in the current thread. Initializes dht if necessary, starts connection handlers,
         runs Runtime (self.runtime) to process incoming requests.
         """
         logger.info(f"Serving {len(self.module_backends)} blocks:")
@@ -96,78 +234,26 @@ class Server(threading.Thread):
     @classmethod
     def create(
         cls,
-        prefix: Optional[str],
-        converted_model_name_or_path: str,
-        throughput: Union[float, str],
-        num_blocks: Optional[int] = None,
-        block_indices: Optional[str] = None,
-        num_handlers: Optional[int] = None,
-        min_batch_size: int = 1,
-        max_batch_size: int = 4096,
-        torch_dtype: str = "auto",
-        cache_size_bytes: Optional[int] = None,
-        device: Optional[Union[str, torch.device]] = None,
-        initial_peers: Sequence[str] = (),
-        compression=CompressionType.NONE,
-        stats_report_interval: Optional[int] = None,
-        custom_module_path=None,
-        update_period: float = 30,
-        expiration: Optional[float] = None,
-        max_block_selection_delay: float = 1,
-        use_auth_token: Optional[str] = None,
         *,
+        dht: DHT,
+        prefix: str,
+        converted_model_name_or_path: str,
+        block_config: BloomConfig,
+        memory_cache: MemoryCache,
+        throughput: float,
+        block_indices: List[int],
+        num_handlers: Optional[int],
+        min_batch_size: int,
+        max_batch_size: int,
+        torch_dtype: torch.dtype,
+        device: Union[str, torch.device],
+        compression: CompressionType,
+        stats_report_interval: Optional[int],
+        update_period: float,
+        expiration: Optional[float],
+        use_auth_token: Optional[str],
         start: bool,
-        **kwargs,
-    ) -> Server:
-        """Create a server with one or more bloom blocks. See run_server.py for documentation."""
-        if custom_module_path is not None:
-            add_custom_models_from_file(custom_module_path)
-        if prefix is None:
-            prefix = converted_model_name_or_path
-            assert UID_DELIMITER not in prefix and CHAIN_DELIMITER not in prefix, (
-                f"Cannot use model name as prefix (contains '{UID_DELIMITER}' or '{CHAIN_DELIMITER}'); "
-                f"Please specify --prefix manually when starting a server"
-            )
-            logger.info(f"Automatic dht prefix: {prefix}")
-        assert (block_indices is None) != (num_blocks is None), "please specify num_blocks or block_indices, not both"
-        if expiration is None:
-            expiration = max(2 * update_period, MAX_DHT_TIME_DISCREPANCY_SECONDS)
-
-        dht = DHT(initial_peers=initial_peers, start=True, **kwargs)
-        visible_maddrs_str = [str(a) for a in dht.get_visible_maddrs()]
-        logger.info(f"Running DHT node on {visible_maddrs_str}, initial peers = {initial_peers}")
-
-        device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        memory_cache = MemoryCache(device, cache_size_bytes)
-
-        assert isinstance(throughput, float) or throughput in ["auto", "eval"]
-        if throughput in ["auto", "eval"]:
-            throughput = get_host_throughput(device, force_eval=(throughput == "eval"))
-
-        if isinstance(torch_dtype, str):
-            torch_dtype = DTYPE_MAP[torch_dtype]
-        assert torch_dtype in DTYPE_MAP.values(), f"torch_dtype must be one of {list(DTYPE_MAP.values())}"
-
-        block_config = BloomConfig.from_pretrained(converted_model_name_or_path, use_auth_token=use_auth_token)
-
-        if block_indices is not None:
-            try:
-                first_block_index, last_block_index = block_indices.split(":")
-                first_block_index, last_block_index = map(int, map(str.strip, (first_block_index, last_block_index)))
-            except Exception as e:
-                logger.error(f"Failed to parse --block_indices ({e}), must be start:end (e.g. 0:18)")
-                raise
-            block_indices = range(first_block_index, last_block_index)
-        else:
-            # If multiple servers (e.g., launched on the same machine by a script) get to this line at the same time,
-            # this delay decreases the probability of a race condition while choosing the best blocks to serve.
-            time.sleep(random.random() * max_block_selection_delay)
-
-            assert num_blocks is not None
-            uids = [f"{prefix}.{block_index}" for block_index in range(block_config.n_layer)]
-            module_infos = get_remote_module_infos(dht, uids, expiration_time=float("inf"))
-            block_indices = choose_best_blocks(num_blocks, module_infos)
-
+    ) -> ModuleContainer:
         module_uids = [f"{prefix}.{block_index}" for block_index in block_indices]
         declare_active_modules(
             dht,
@@ -215,33 +301,36 @@ class Server(threading.Thread):
 
     def run_in_background(self, await_ready=True, timeout=None):
         """
-        Starts Server in a background thread. if await_ready, this method will wait until background server
+        Starts ModuleContainer in a background thread. if await_ready, this method will wait until the container
         is ready to process incoming requests or for :timeout: seconds max.
         """
         self.start()
         if await_ready and not self.ready.wait(timeout=timeout):
-            raise TimeoutError("Server didn't notify .ready in {timeout} seconds")
+            raise TimeoutError("ModuleContainer didn't notify .ready in {timeout} seconds")
 
     @property
     def ready(self) -> mp.synchronize.Event:
         """
-        An event (multiprocessing.Event) that is set when the server is ready to process requests.
+        An event (multiprocessing.Event) that is set when the container is ready to process requests.
 
         Example
         =======
-        >>> server.start()
-        >>> server.ready.wait(timeout=10)
-        >>> print("Server ready" if server.ready.is_set() else "Server didn't start in 10 seconds")
+        >>> container.start()
+        >>> container.ready.wait(timeout=10)
+        >>> print("Container ready" if container.ready.is_set() else "Container didn't start in 10 seconds")
         """
         return self.runtime.ready  # mp.Event that is true if self is ready to process batches
 
     def shutdown(self):
         """
-        Gracefully terminate the server, process-safe.
-        Please note that terminating server otherwise (e.g. by killing processes) may result in zombie processes.
+        Gracefully terminate the container, process-safe.
+        Please note that terminating container otherwise (e.g. by killing processes) may result in zombie processes.
         If you did already cause a zombie outbreak, your only option is to kill them with -9 (SIGKILL).
         """
         if self.module_backends:
+            self.dht_handler_thread.stop.set()
+            self.dht_handler_thread.join()
+
             declare_active_modules(
                 self.dht,
                 self.module_backends.keys(),
@@ -258,25 +347,18 @@ class Server(threading.Thread):
             process.join()
         logger.debug("Connection handlers terminated")
 
-        if self.module_backends:
-            self.dht_handler_thread.stop.set()
-            self.dht_handler_thread.join()
-
         if self.checkpoint_saver is not None:
             self.checkpoint_saver.stop.set()
             self.checkpoint_saver.join()
 
-        self.dht.shutdown()
-        self.dht.join()
-
         logger.debug(f"Shutting down runtime")
-
         self.runtime.shutdown()
-        logger.info("Server shut down succesfully")
+
+        logger.info("Module container shut down succesfully")
 
 
 class ModuleAnnouncerThread(threading.Thread):
-    """Periodically announces that this server hosts the specified modules, visible to all DHT peers"""
+    """Periodically announces that this container hosts the specified modules, visible to all DHT peers"""
 
     def __init__(
         self,
