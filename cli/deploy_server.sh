@@ -5,7 +5,8 @@
 #################
 
 instructions() {
-  echo "Usage: $0 [-i] [ -d ] [ -p ] [ -b ] [-a] [-t]" >&2
+  echo "Usage: $0 [-m] [-i] [ -d ] [ -p ] [ -b ] [-a] [-t]" >&2
+  echo " -m: model name"
   echo " -i: initial peer"
   echo " -d: device" >&2
   echo " -p: server identity path" >&2
@@ -19,8 +20,10 @@ if [ ! $# -ge 8 ]; then
     instructions
 fi
 
-while getopts ":i:d:p:b:a:t:" option; do
+while getopts ":m:i:d:p:b:a:t:" option; do
     case $option in
+        m)  MODEL_NAME=${OPTARG}
+            ;;
         i)  INITIAL_PEER=${OPTARG}
             ;;
         d)  DEVICE=${OPTARG}
@@ -42,6 +45,7 @@ done
 echo "=========="
 echo "= Config ="
 echo "=========="
+echo "Model name: ${MODEL_NAME}"
 echo "Initial peer: ${INITIAL_PEER}"
 echo "Device: ${DEVICE}"
 echo "Server name: ${SERVER_ID_PATH}"
@@ -70,5 +74,12 @@ fi
 # Run server #
 ##############
 
-python -m cli.run_server --converted_model_name_or_path bigscience/test-bloomd-6b3 --device ${DEVICE} --initial_peer ${INITIAL_PEER} \
-  --block_indices ${BLOCK_IDS} --torch_dtype float32 --identity_path ${SERVER_ID_PATH} --host_maddrs ${HOST_MADDR} &> ${SERVER_ID_PATH}.log
+# [('NONE', 0),
+#  ('MEANSTD_16BIT', 1),
+#  ('FLOAT16', 2),
+#  ('QUANTILE_8BIT', 3),
+#  ('UNIFORM_8BIT', 4),
+#  ('BLOCKWISE_8BIT', 5)]
+
+python -m cli.run_server --converted_model_name_or_path ${MODEL_NAME} --device ${DEVICE} --initial_peer ${INITIAL_PEER} \
+  --block_indices ${BLOCK_IDS} --compression UNIFORM_8BIT --identity_path ${SERVER_ID_PATH} --host_maddrs ${HOST_MADDR} --load_in_8bit # &> ${SERVER_ID_PATH}.log
